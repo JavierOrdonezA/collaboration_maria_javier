@@ -1,0 +1,49 @@
+Bootstrap: docker
+From: ubuntu:20.04
+
+%post
+    export DEBIAN_FRONTEND=noninteractive  
+
+    # Update and install required system packages
+    apt-get update && apt-get install -y \
+        software-properties-common \
+        wget \
+        git \
+        build-essential \
+        tcsh \
+        perl \
+        libwww-perl \
+        default-jre \
+        gawk \
+        python3.9 \
+        python3.9-dev \
+        python3.9-distutils \
+        && apt-get clean
+
+    # Get pip for Python 3.9
+    wget https://bootstrap.pypa.io/get-pip.py
+    python3.9 get-pip.py
+
+    # Force symlinks for python and pip to point to Python 3.9
+    ln -sf /usr/bin/python3.9 /usr/bin/python
+    ln -sf /usr/local/bin/pip /usr/bin/pip
+
+    # Install required Python libraries
+    pip install --no-cache-dir \
+        "numpy<2.0.0"   \
+        pandas \
+        requests \
+        pyarrow \
+        pyfaidx \
+        gtfparse \
+        tqdm  \
+        psutil 
+
+
+
+    # Clean up
+    rm get-pip.py
+
+%runscript
+    exec python "$@"
+

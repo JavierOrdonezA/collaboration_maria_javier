@@ -1,0 +1,12 @@
+This code was to more accurately simulate mutations across the genome from CbASE cancer data, per cancer type 
+outputs a mutated geneome which then split into pepeties and calculate new binding energy for.
+
+Assumes only expressed genes produce peptides, as filters by gtex expression. 
+
+Need to change as Javi will now output a table with all possible mutations and their binding energies.
+So in step 4 instead of applying mutations to geneome, store position and mutation chosen in multinomial smapling.
+Then look up in Javis table the binding energy only of the chnages and plot.
+
++change to use Javis improved transcripts 
+
+NOTE: only draft of code, need to check more carefully when Javi is done with table. 

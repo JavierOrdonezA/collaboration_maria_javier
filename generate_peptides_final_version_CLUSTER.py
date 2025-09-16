@@ -8,26 +8,41 @@ This pipeline performs:
 3. K-mer analysis and mutation generation
 4. Peptide sequence analysis with mutations
 
+In gene encoded in the negative strand we did:
+Genoma (+)        100 101 102 103 104 105 106 107 108
+                  |   |   |   |   |   |   |   |   |
+                  A   G   T   A   C   G   C   T   A   (+)
+                                                  ↑ codón
+Gen codificante   ──────────────────────────────────────
+hebra (–)         T   A   G   C   G   T   A   C   T   (reverse-complement)
+                 108 107 106 105 104 103 102 101 100   abs_coord_all_seq
+
+We reverse complemented the seq and the abs coordinate 
 Author: J.Ordonez A
 
 """
+# %%
 
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional, Any
+import warnings
 
 import pandas as pd
 import numpy as np
 from pyfaidx import Fasta
 from gtfparse import read_gtf
+import seaborn as sns
+import matplotlib.pyplot as plt
+import argparse
 from tqdm import tqdm
 import sys
+import psutil
+import os
 import logging
 import warnings
 warnings.filterwarnings("ignore")
-
 # %%
 """
-# ) Extract only CDS lines from the GTF
 # ) Extract only CDS lines from the GTF
 #======================================================================
 #======================================================================
@@ -35,6 +50,7 @@ warnings.filterwarnings("ignore")
 # these CDS data are the ones we will analyze
 #======================================================================
 #======================================================================
+
 with open("gencode.v47.annotation.gtf") as gtf, 
         open("gencode.v47.CDS.gtf", "w") as out:
     for line in gtf:
@@ -53,14 +69,20 @@ cds_records = [fields for fields in records if fields[2] == "CDS"]
 """
 
 
+def print_mem_usage(label):
+    process = psutil.Process(os.getpid())
+    mem = process.memory_info().rss / (1024**2)
+    print(f"[{label}] Mem usage: {mem:.2f} MB")
+
+
 class GenomicsConfig:
     # Configuration class for genomics analysis parameters.#
 
     def __init__(self):
         # File paths - update these to your actual paths
         self.path_cds_annotation = '/Users/fordonez/Documents/PhD_Thesis/' \
-            + 'Task_16_dN_dS/data/gen_code_data/gencode.v47.CDS.gtf'
-        self.path_grch38 = '/Users/fordonez/Documents/PhD_Thesis/Task_16_dN_dS/data/gen_code_data/' \
+            + 'somatic_mutation_generation/gencode.v47.CDS.gtf'
+        self.path_grch38 = '/Users/fordonez/Documents/PhD_Thesis/somatic_mutation_generation/' \
             + 'GRCh38.p14.genome.fa'
 
         # Analysis parameters
@@ -120,12 +142,7 @@ class CodonTable:
 
 
 class IsoformSelector:
-    """
-    ---------------------------------------------------------------------------------------------
-    The CDS ENTRIES EXTRACTED from the GTF file are the data that will be analyzed by this class
-    ---------------------------------------------------------------------------------------------
-    Handles isoform selection and canonical transcript identification.
-    """
+    """Handles isoform selection and canonical transcript identification."""
 
     @staticmethod
     def get_isoforms_by_gene(df: pd.DataFrame, chromosome: str) -> pd.DataFrame:
@@ -187,7 +204,7 @@ class IsoformSelector:
         df = df_annotations.copy()
         df_chr = df[df['seqname'] == chromosome].copy()
 
-        # 2)Extract CCDS flag
+        # 2)Extract CCDS and MANE_Selectflag
         df_chr['CCDS'] = df_chr['tag'].str.contains(r'\bCCDS\b', na=False)
 
         df_chr['MANE_Select'] = df_chr['tag'].str.contains(
@@ -197,9 +214,9 @@ class IsoformSelector:
         is_pc = df_chr['gene_type'] == 'protein_coding'
         # pass_pc = is_pc & df_chr['CCDS']
         pass_pc = is_pc & (df_chr['CCDS'] | df_chr['MANE_Select'])
+
         # pass_npc = ~is_pc & df_chr['level'].isin([1, 2])
         pass_npc = is_pc & df_chr['level'].isin([1, 2])
-
         df_q = df_chr[pass_pc | pass_npc].copy()
 
         # 4) Calculate segment lengths
@@ -228,11 +245,11 @@ class IsoformSelector:
 
     @staticmethod
     def pick_canonical_transcript_2(df: pd.DataFrame) -> pd.DataFrame:
-
-        # From a GTF‐style DataFrame with columns including:
-        # ['gene_id','transcript_id','feature','start','end','tag']
-        # return one row per gene giving the chosen canonical transcript_id.
-
+        """
+        From a GTF‐style DataFrame with columns including:
+        ['gene_id','transcript_id','feature','start','end','tag']
+        return one row per gene giving the chosen canonical transcript_id.
+        """
         df = df.copy()
 
         # 1) Calculate CDS lengths
@@ -429,6 +446,12 @@ class SequenceExtractor:
         """
         Fetch chrom:start-end (1-based inclusive) with ±L padding.
         Returns the sequence string on the correct strand.
+
+        Negative strand (-): 3' |---ATGCGTACCTGAA---|---CTTGCGTACCGAT---| 5'
+                          exon1 (13 bp)         exon2 (13 bp)
+
+        Positive strand (+): 5' |---ATCGGTACGCAA---|---GTCAGGTACGCAT---| 3'
+                                exon2 (13 bp)         exon1 (13 bp)
         """
         # pyfaidx is 1-based inclusive under the hood
         seq = self.genome[chrom][start - 1 - L: end + L].seq
@@ -446,30 +469,8 @@ class SequenceExtractor:
     ) -> pd.DataFrame:
         """
         For each (gene_id, transcript_id) pair in `canonical_df`:
-          1) Filter exons in `annotation_df` for the specified `chromosome`, `gene_id`, and `transcript_id`.
-
-          2) Sorts exons by `exon_number` in ascending order to follow the
-             **transcriptional (5' to 3') order** of the transcript:
-                - For transcripts on the **positive strand ('+')**, this order
-                matches genomic coordinates increasing from left to right.
-                - For transcripts on the **negative strand ('-')**, this order
-                corresponds to genomic coordinates **decreasing** (from higher to
-                lower positions).
-
-            Examples:
-                - Gene **C1orf159** on chromosome 1 is encoded on the negative strand:
-                    Exons in transcriptional order have decreasing coordinates:
-                    [[1091470, 1091545], [1090351, 1090430], [1087500, 1087599],
-                    [1087137, 1087206], [1085876, 1086014], [1084479, 1084508],
-                    [1084351, 1084385], [1082894, 1082989]]
-
-                - Gene **OR4F5** on chromosome 1 is encoded on the positive strand:
-                    Exons in transcriptional order have increasing coordinates:
-                    [[65563, 65575], [69035, 70007]]
-
-            ⚠️ Do not re-sort exons by genomic start/end coordinates. Sorting by
-            `exon_number` already ensures correct biological order regardless of strand.
-
+          1. Filter exons in `annotation_df` for the specified `chromosome`, `gene_id`, and `transcript_id`.
+          2. Sort exons by `exon_number`.
           3. For each exon:
              a. Expand its genomic coordinates by ±padding bases to capture flanking context.
              b. Retrieve the padded DNA sequence via `fetch_sequence`.
@@ -509,18 +510,6 @@ class SequenceExtractor:
               - rna_abs_coord_exon_all_seq
               - rna_coord_exon
               - rna_coord_all_seq
-
-        Notes
-        -------
-        - Exons are **sorted by `exon_number` in ascending order** to follow the
-            transcriptional structure of the transcript (not genomic order).
-        - For transcripts on the **'−' strand**, this means that exon coordinates
-            decrease along the transcript. You should **not re-sort by start/end**
-            coordinates if your goal is to preserve biological mRNA order.
-        - The `fetch_sequence` method must take care of **strand orientation**.
-            If the strand is '-', each exon sequence must be reverse-complemented.
-            In this case, concatenating the exon sequences in transcriptional order
-            will yield the correct 5'→3' transcript sequence without further reversal.      
         """
 
         # --- containers to accumulate ---
@@ -536,7 +525,6 @@ class SequenceExtractor:
         coord_abs_exons_final_rna = []     # rna_abs_coord_exon_all_seq
         rna_coord_relative_exone = []       # rna_coord_exon
         rna_coord_relative_all_seq = []     # rna_coord_all_seq
-
         strand_h38 = []
         # Iterate over each canonical isoform
         for _, can_row in canonical_df.iterrows():
@@ -586,6 +574,7 @@ class SequenceExtractor:
                 seqs.append(seq_padded)
 
                 # Build a list of all genomic positions for the padded region [padded_start .. padded_end]
+
                 padded_positions = list(range(padded_start, padded_end + 1))
                 if exon["strand"] == "-":
                     padded_positions = padded_positions[::-1]
@@ -650,6 +639,7 @@ class SequenceExtractor:
         out['rna_coord_exon'] = rna_coord_relative_exone
         out['rna_coord_all_seq'] = rna_coord_relative_all_seq
         out['strand_h38'] = strand_h38
+
         return out.sort_values('dna_coord_exon_seqs_x0', ascending=True).reset_index(drop=True)
 
 
@@ -791,8 +781,7 @@ class MutationAnalyzer:
                     wt_aa is not None and mut_aa is not None and wt_aa == mut_aa) else 1
 
                 # Determine if the mutation is a nonsynonymous stop codon
-                is_nonsyn_stop = int(is_nonsyn and mut_aa != '*')
-
+                is_nonsyn_nonstop = int(is_nonsyn and mut_aa != '*')
                 # Copy all original fields and add the mutation
                 rec = row.to_dict()
                 rec.update({
@@ -801,7 +790,7 @@ class MutationAnalyzer:
                     'wild_aa': wt_aa,
                     'mutated_aa': mut_aa,
                     'is_nonsynonymous': is_nonsyn,
-                    'is_nonsynonymous_nonstop': is_nonsyn_stop
+                    'is_nonsynonymous_nonstop': is_nonsyn_nonstop
                 })
                 new_records.append(rec)
 
@@ -809,8 +798,8 @@ class MutationAnalyzer:
         desired_cols = [
             'gene_id', 'transcript_id', 'gene_name',
             'k_mer', 'central_base', 'mutated_base',
-            'codon', 'mutated_codon', 'wild_aa', 'mutated_aa', 'is_nonsynonymous', 'is_nonsynonymous_nonstop',
-            'exon_index', 'coord_abs', 'coord_rna', 'mod3', 'mutation_type', 'strand_h38', 'mutation_type'
+            'codon', 'mutated_codon', 'wild_aa', 'mutated_aa', 'is_nonsynonymous',
+            'is_nonsynonymous_nonstop', 'exon_index', 'coord_abs', 'coord_rna', 'mod3', 'strand_h38', 'mutation_type'
         ]
         df_mut = pd.DataFrame(new_records)
 
@@ -920,7 +909,8 @@ class PeptideAnalyzer:
              'absolute_coord','wild_codon','mutated_codon',
              'wild_aa','mutated_aa','is_nonsynonymous',
              'position_in_peptide',
-             'coord_seq_peptide_x0','coord_seq_peptide_xf']
+             'coord_seq_peptide_x0','coord_seq_peptide_xf',
+             'coord_seq_peptide','rna_n_coordinates']
         """
         # 1) collect per-transcript lists
         gene_ids_t: List[List[str]] = []
@@ -947,16 +937,15 @@ class PeptideAnalyzer:
         # 3) slide window over each sequence
 
         # for idx, seq in enumerate(rna_seqs_all_t):
-        # for idx, seq in tqdm(enumerate(rna_seqs_all_t), total=len(rna_seqs_all_t), desc="processing transcripts"):
-
         for idx, seq in tqdm(enumerate(rna_seqs_all_t), total=len(rna_seqs_all_t),
                              desc="processing transcripts", file=sys.stdout):
+
             seq = seq.upper()
             # seq = dna_seq.upper()[0:42]  # Take the first 30 bases as an example (same as before)
             # Take the first 30 bases as an example (same as before)
             # seq = dna_seq.upper()[0:30]
 
-            rna_coords = rna_n_coordinates[idx]
+            # rna_coords = rna_n_coordinates[idx]
             abs_coords = abs_coord_all_t[idx]
             gene_id = gene_ids_t[idx][0]
             transcript_id = transcript_ids_t[idx][0]
@@ -1010,6 +999,9 @@ class PeptideAnalyzer:
                         'codon_position': codon_num,
                         'base_position_in_codon': pos_in_codon,
                         'absolute_coord': mut.coord_abs,
+                        'k_mer': mut.k_mer,
+                        'central_base': mut.central_base,
+                        'mutated_base': mut.mutated_base,
                         'wild_codon': mut.codon,
                         'mutated_codon': mut.mutated_codon,
                         'wild_aa': mut.wild_aa,
@@ -1019,6 +1011,7 @@ class PeptideAnalyzer:
                         'position_in_peptide': mut_pos,
                         'coord_seq_peptide_x0': pep_coords_x0,
                         'coord_seq_peptide_xf': pep_coords_xf
+                        # 'coord_seq_peptide': pep_coords,
                         # 'rna_n_coordinates': rna_coords
                     })
 
@@ -1055,6 +1048,8 @@ class GenomicsAnalysisPipeline:
         # Load genome
         self.genome = Fasta(self.config.path_grch38)
         self.sequence_extractor = SequenceExtractor(self.genome)
+
+        logging.getLogger().setLevel(logging.WARNING)
 
         # Load annotations
         self.annotations = read_gtf(
@@ -1106,7 +1101,7 @@ class GenomicsAnalysisPipeline:
             filtered_annotations,
             self.config.chromosome,
             self.config.k_mer_neighbors
-        ).head(20)
+        )
         print(
             f"Extracted sequences for {len(sequences_with_data)} transcripts")
 
@@ -1141,106 +1136,122 @@ class GenomicsAnalysisPipeline:
             'n_mutations': len(mutations_df),
             'n_nonsynonymous_mutations': len(mutations_df[mutations_df['is_nonsynonymous'] == 1]),
             'n_peptides': len(peptides_df),
-            'n_nonsynonymous_peptides': len(peptides_df[peptides_df['is_nonsynonymous'] == 1])
-        }
+            'n_nonsynonymous_peptides': len(peptides_df[peptides_df['is_nonsynonymous'] == 1])}
         return stats
 
 
-# %%
-# 1) Construye la configuración con valores por defecto
-config = GenomicsConfig()
-print("=== CONFIGURATION ===")
-print(f" GTF file  : {config.path_cds_annotation}")
-print(f" FASTA file: {config.path_grch38}")
-print(f" Chromosome: {config.chromosome}")
-print(f" k-mer pad : {config.k_mer_neighbors}")
-print(f" Peptide length: {config.peptide_length}")
-print("-" * 40)
+def main():
+    parser = argparse.ArgumentParser(
+        description="Genomics pipeline: isoforms → k-mers → peptides"
+    )
+    parser.add_argument("--gtf",    required=True, help="CDS GTF file")
+    parser.add_argument("--fasta",  required=True, help="Genome FASTA file")
+    parser.add_argument("--chrom",  default="chr1",
+                        help="Chromosome to analyse")
+    parser.add_argument("--kmer",   type=int, default=2,
+                        help="k-mer neighbor padding")
+    parser.add_argument("--pep-len", type=int, default=9,
+                        help="Peptide length (AAs)")
+    parser.add_argument("--outdir",   default="results",
+                        help="Directory in which to write output Parquet files")
+    args = parser.parse_args()
 
-# 2) Instancia y carga datos
-pipe = GenomicsAnalysisPipeline(config)
-pipe.load_data()
+    # build & override config
+    config = GenomicsConfig()
+    config.path_cds_annotation = args.gtf
+    config.path_grch38 = args.fasta
+    config.chromosome = args.chrom
+    config.k_mer_neighbors = args.kmer
+    config.peptide_length = args.pep_len
+    config.window_length = 3 * config.peptide_length
+
+    # run
+    pipe = GenomicsAnalysisPipeline(config)
+    pipe.load_data()
+
+    (canonical_with_exons_penta,
+     df_kmers,
+     df_mutated,
+     df_peptides,
+     df_unique_nonsyn_nonstop,
+     _,
+     summary_filter_annot) = pipe.run_analysis()
+
+    stats = pipe.get_summary_statistics(
+        canonical_with_exons_penta, df_mutated, df_peptides
+    )
+    print("\n=== SUMMARY ===")
+    for k, v in stats.items():
+        print(f"{k:30s}: {v}")
+
+    # save outputs
+    # save outputs in Parquet
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    print_mem_usage("before canonical save")
+    print("Saving canonical_with_exons_penta")
+    canonical_with_exons_penta.to_parquet(
+        outdir/f"{args.chrom}_sequences_table.parquet", index=False
+    )
+    del canonical_with_exons_penta
+
+    print("Saving df_kmers")
+    print_mem_usage("before df_kmers save")
+    df_kmers.to_parquet(
+        outdir/f"{args.chrom}_kmers.parquet", index=False
+    )
+    del df_kmers
+
+    print("Saving summary_filter_annot")
+    print_mem_usage("before summary_filter_annot save")
+    summary_filter_annot.to_parquet(
+        outdir/f"{args.chrom}_summary_filter_annot.parquet", index=False
+    )
+    del summary_filter_annot
+
+    print("Saving df_mutated")
+    print_mem_usage("before df_mutated save")
+    df_mutated.to_parquet(
+        outdir/f"{args.chrom}_mutations.parquet", index=False
+    )
+    del df_mutated
+
+    print("Saving df_unique_mutated")
+    print_mem_usage("before df_unique_mutated save")
+    df_unique_nonsyn_nonstop.to_parquet(
+        outdir/f"{args.chrom}_unique_mutated_nonsyn_nonstop.parquet", index=False
+    )
+    del df_unique_nonsyn_nonstop
+
+    print("Saving df_peptides")
+    print_mem_usage("before df_peptides save")
+    df_peptides.to_parquet(
+        outdir/f"{args.chrom}_peptides.parquet", index=False
+    )
+    del df_peptides
+
+    """
+    canonical_with_exons_penta.to_csv(
+        outdir/f"{args.chrom}_sequences_table.csv", index=False
+    )
+    df_kmers.to_csv(
+        outdir/f"{args.chrom}_kmers.csv", index=False
+    )
+    df_mutated.to_csv(
+        outdir/f"{args.chrom}_mutations.csv", index=False
+    )
+    df_peptides.to_csv(
+        outdir/f"{args.chrom}_peptides.csv", index=False
+    )
+    summary_filter_annot.to_csv(
+        outdir/f"{args.chrom}_summary_filter_annot.csv", index=False
+    )
+    """
+    print(f"\nAll results written to {outdir.resolve()}")
 
 
-# 3) Ejecuta el pipeline completo
-(canonical_with_exons_penta,
-    df_kmers,
-    df_mutated,
-    df_peptides,
-    df_unique_nonsyn_nonstop,
-    summary_all_annot,
-    summary_filter_annot) = pipe.run_analysis()
-
-# 4) Calcula estadísticas y muéstralas
-stats = pipe.get_summary_statistics(
-    canonical_with_exons_penta,
-    df_mutated,
-    df_peptides
-)
-print("\n=== SUMMARY ===")
-for name, count in stats.items():
-    print(f"{name:30s}: {count}")
-
-# 5) Opcional: mira los primeros registros de cada DataFrame
-print("\n--- sample outputs ---")
-print("sequences (first 2 rows):")
-print(canonical_with_exons_penta, "\n")
-
-print("kmers (first 5 rows):")
-print(df_kmers.head(5), "\n")
-
-print("mutations (first 5 rows):")
-print(df_mutated.head(5), "\n")
-
-print("peptides (first 5 rows):")
-print(df_peptides.head(5), "\n")
+if __name__ == "__main__":
+    main()
 
 # %%
-# %%
-# %%
-# %%
-# %%
-# %%
-df_peptides[(df_peptides["gene_id"] == "ENSG00000187634.13") &
-            (df_peptides["absolute_coord"] == 924948)]
-# %%
-
-df_mutated[(df_mutated["gene_id"] == "ENSG00000187634.13") &
-           (df_mutated[""] == 924948)]
-
-# %%
-len("ATGCCGGCGGTCAAGAAGGAGTTCCCGGGCCGCGAGGACCTGGCCCTGGCTCTGGCCACGTTCCACCCGACCCTGGCCGCGCTGCCGCTGCCGCCGCTGCCAGGCTACCTGGCGCCACTGCCCGCGGCGGCCGCCCTCCCCCCGGCCGCCTCGCTGCCCGCCTCGGCCGCCGGTTACGAGGCTCTGCTGGCCCCGCCGCTCCGCCCCCCGCGCGCCTACCTCAGCCTGCACGAGGCCGCCCCGCACCTCCACCTGCCCAGGGACCCGCTGGCCCTCGAGCGCTTCTCGGCCACCGCGGCCGCGGCCCCGGATTTCCAGCCGCTGCTGGACAACGGCGAGCCGTGCATCGAGGTGGAGTGCGGCGCCAACCGCGCGCTGCTCTACGTGCGCAAACTCTGCCAGGGCAGCAAGGGCCCGTCCATCCGCCACCGCGGCGAGTGGCTCACGCCCAACGAGTTCCAGTTCGTCAGCGGCCGCGAGACGGCCAAGGACTGGAAGCGCAGCATCCGCCACAAA")/3
-# %%
-# %%
-# %%
-# %%
-
-# %%
-# %%
-# save outputs
-# save outputs in Parquet
-outdir = Path(
-    '/Users/fordonez/Documents/PhD_Thesis/somatic_mutation_generation/results_mutations')
-outdir.mkdir(parents=True, exist_ok=True)
-
-canonical_with_exons_penta.to_parquet(
-    outdir/f"{'chr1'}_sequences.parquet", index=False
-)
-df_kmers.to_parquet(
-    outdir/f"{'chr1'}_kmers.parquet", index=False
-)
-df_mutated.to_parquet(
-    outdir/f"{'chr1'}_mutations.parquet", index=False
-)
-df_peptides.to_parquet(
-    outdir/f"{'chr1'}_peptides.parquet", index=False
-)
-# %%
-# %%
-517/3
-[924430, 924431, 924432, 924433, 924434, 924435, 924436, 924437, 924438, 924439, 924440, 924441, 924442, 924443, 924444, 924445, 924446, 924447, 924448, 924449, 924450, 924451, 924452, 924453, 924454, 924455, 924456, 924457, 924458, 924459, 924460, 924461, 924462, 924463, 924464, 924465, 924466, 924467, 924468, 924469, 924470, 924471, 924472, 924473, 924474, 924475, 924476, 924477, 924478, 924479, 924480, 924481, 924482, 924483, 924484, 924485, 924486, 924487, 924488, 924489, 924490, 924491, 924492, 924493, 924494, 924495, 924496, 924497, 924498, 924499, 924500, 924501, 924502, 924503, 924504, 924505, 924506, 924507, 924508, 924509, 924510, 924511, 924512, 924513, 924514, 924515, 924516, 924517, 924518, 924519, 924520, 924521, 924522, 924523, 924524, 924525, 924526, 924527, 924528, 924529, 924530, 924531, 924532, 924533, 924534, 924535, 924536, 924537, 924538, 924539, 924540, 924541, 924542, 924543, 924544, 924545, 924546, 924547, 924548, 924549, 924550, 924551, 924552, 924553, 924554, 924555, 924556, 924557, 924558, 924559, 924560, 924561, 924562, 924563, 924564, 924565, 924566, 924567, 924568, 924569, 924570, 924571, 924572, 924573, 924574, 924575, 924576, 924577, 924578, 924579, 924580, 924581, 924582, 924583, 924584, 924585, 924586, 924587, 924588, 924589, 924590, 924591, 924592, 924593, 924594, 924595, 924596, 924597, 924598, 924599, 924600, 924601, 924602, 924603, 924604, 924605, 924606, 924607, 924608, 924609, 924610, 924611, 924612, 924613, 924614, 924615, 924616, 924617, 924618, 924619, 924620, 924621, 924622, 924623, 924624, 924625, 924626, 924627, 924628, 924629, 924630, 924631, 924632, 924633, 924634, 924635, 924636, 924637, 924638, 924639, 924640, 924641, 924642, 924643, 924644, 924645, 924646, 924647, 924648, 924649, 924650, 924651, 924652, 924653, 924654, 924655, 924656, 924657, 924658, 924659, 924660, 924661, 924662, 924663, 924664, 924665, 924666, 924667, 924668, 924669, 924670, 924671, 924672, 924673, 924674, 924675, 924676, 924677, 924678, 924679, 924680, 924681, 924682, 924683, 924684, 924685, 924686, 924687, 924688, 924689, 924690,
-    924691, 924692, 924693, 924694, 924695, 924696, 924697, 924698, 924699, 924700, 924701, 924702, 924703, 924704, 924705, 924706, 924707, 924708, 924709, 924710, 924711, 924712, 924713, 924714, 924715, 924716, 924717, 924718, 924719, 924720, 924721, 924722, 924723, 924724, 924725, 924726, 924727, 924728, 924729, 924730, 924731, 924732, 924733, 924734, 924735, 924736, 924737, 924738, 924739, 924740, 924741, 924742, 924743, 924744, 924745, 924746, 924747, 924748, 924749, 924750, 924751, 924752, 924753, 924754, 924755, 924756, 924757, 924758, 924759, 924760, 924761, 924762, 924763, 924764, 924765, 924766, 924767, 924768, 924769, 924770, 924771, 924772, 924773, 924774, 924775, 924776, 924777, 924778, 924779, 924780, 924781, 924782, 924783, 924784, 924785, 924786, 924787, 924788, 924789, 924790, 924791, 924792, 924793, 924794, 924795, 924796, 924797, 924798, 924799, 924800, 924801, 924802, 924803, 924804, 924805, 924806, 924807, 924808, 924809, 924810, 924811, 924812, 924813, 924814, 924815, 924816, 924817, 924818, 924819, 924820, 924821, 924822, 924823, 924824, 924825, 924826, 924827, 924828, 924829, 924830, 924831, 924832, 924833, 924834, 924835, 924836, 924837, 924838, 924839, 924840, 924841, 924842, 924843, 924844, 924845, 924846, 924847, 924848, 924849, 924850, 924851, 924852, 924853, 924854, 924855, 924856, 924857, 924858, 924859, 924860, 924861, 924862, 924863, 924864, 924865, 924866, 924867, 924868, 924869, 924870, 924871, 924872, 924873, 924874, 924875, 924876, 924877, 924878, 924879, 924880, 924881, 924882, 924883, 924884, 924885, 924886, 924887, 924888, 924889, 924890, 924891, 924892, 924893, 924894, 924895, 924896, 924897, 924898, 924899, 924900, 924901, 924902, 924903, 924904, 924905, 924906, 924907, 924908, 924909, 924910, 924911, 924912, 924913, 924914, 924915, 924916, 924917, 924918, 924919, 924920, 924921, 924922, 924923, 924924, 924925, 924926, 924927, 924928, 924929, 924930, 924931, 924932, 924933, 924934, 924935, 924936, 924937, 924938, 924939, 924940, 924941, 924942, 924943, 924944, 924945, 924946, 924947, 924948, 924949, 924950]
-
-
-['CCATGCCGGCGGTCAAGAAGGAGTTCCCGGGCCGCGAGGACCTGGCCCTGGCTCTGGCCACGTTCCACCCGACCCTGGCCGCGCTGCCGCTGCCGCCGCTGCCAGGCTACCTGGCGCCACTGCCCGCGGCGGCCGCCCTCCCCCCGGCCGCCTCGCTGCCCGCCTCGGCCGCCGGTTACGAGGCTCTGCTGGCCCCGCCGCTCCGCCCCCCGCGCGCCTACCTCAGCCTGCACGAGGCCGCCCCGCACCTCCACCTGCCCAGGGACCCGCTGGCCCTCGAGCGCTTCTCGGCCACCGCGGCCGCGGCCCCGGATTTCCAGCCGCTGCTGGACAACGGCGAGCCGTGCATCGAGGTGGAGTGCGGCGCCAACCGCGCGCTGCTCTACGTGCGCAAACTCTGCCAGGGCAGCAAGGGCCCGTCCATCCGCCACCGCGGCGAGTGGCTCACGCCCAACGAGTTCCAGTTCGTCAGCGGCCGCGAGACGGCCAAGGACTGGAAGCGCAGCATCCGCCACAAAGGT', 'AGGGAAAAGTCTGAAGACGCTTATGTCCAAGGGGATCCTGCAGGTGCATCCTCCGATCTGCGACTGCCCGGGCTGCCGAATATCCTCCCCGGTGGT', 'AGAACCGGGGGCGGCTGGCAGACAAGAGGACAGTCGCCCTGCCTGCCGCCCGGAACCTGAAGAAGGAGCGAACTCCCAGCTTCTCTGCCAGCGATGGTGACAGCGACGGGAGTGGCCCCACCTGTGGGCGGCGGCCAGGCTTGAAGCAGGAGGATGGTCCGCACATCCGTATCATGAAGAGAAGGT', 'AGAGTCCACACCCACTGGGACGTGAACATCTCTTTCCGAGAGGCGTCCTGCAGGT', 'AGCCAGGACGGCAACCTTCCCACCCTCATATCCAGCGTCCACCGCAGCCGCCACCTCGTTATGCCCGAGCATCAGAGCCGCTGTGAATTCCAGAGAGGCAGCCTGGAGATTGGCCTGCGACCCGCCGGT', 'AGGTGACCTGTTGGGCAAGAGGCTGGGCCGCTCCCCCCGTATCAGCAGCGACTGCTTTTCAGAGAAGAGGGCACGAAGCGAATCGCCTCAAGGT', 'AGAGGCGCTGCTGCTGCCGCGGGAGCTGGGGCCCAGCATGGCCCCGGAGGACCATTACCGCCGGCTTGTGTCAGCACTGAGCGAGGCCAGCACCTTTGAGGACCCTCAGCGCCTCTACCACCTGGGCCTCCCCAGCCACGGT',
-    'AGATCTCCTGAGGGTCCGGCAGGAGGTGGCGGCTGCAGCTCTGAGGGGCCCCAGTGGCCTGGAAGCCCACCTGCCCTCCTCCACGGCAGGTCAGCGTCGGAAGCAGGGCCTGGCTCAGCACCGGGAGGGCGCCGCCCCAGCTGCCGCCCCGTCCTTCTCGGAGAGGT', 'AGGGAGCTGCCTCAGCCGCCCCCCTTGCTGTCGCCGCAGAATGCCCCTCACGTCGCCCTGGGCCCCCATCTCAGGCCCCCCTTCCTGGGGGTGCCCTCGGCTCTGTGCCAGACCCCAGGT', 'AGGCTACGGCTTCCTGCCCCCCGCGCAGGCGGAGATGTTCGCCTGGCAGCAGGAGCTCCTGCGGAAGCAGAACCTGGCCCGGT', 'AGGCTGGAGCTGCCCGCCGACCTCCTGCGGCAGAAGGAGCTGGAGAGCGCGCGCCCACAGCTGCTGGCGCCCGAGACCGCCCTGCGCCCCAACGACGGCGCCGAGGAGCTGCAGCGGCGCGGGGCCCTGCTGGTGCTGAACCACGGCGCGGCGCCACTGCTGGCCCTGCCCCCCCAGGGGCCCCCGGGCTCCGGACCCCCCACCCCGTCCCGGGACTCTGCCCGGCGAGCCCCCCGGAAGGGGGGTCCCGGCCCTGCCTCAGCGCGGCCCAGCGAGTCCAAGGAGATGACGGGGGCTAGGCTCTGGGCACAAGATGGCTCGGAAGACGAGCCCCCCAAAGACTCGGACGGAGAGGACCCCGAGACGGCAGCTGTTGGGTGCAGGGGGCCCACTCCGGGCCAAGCTCCAGCTGGAGGGGCCGGCGCCGAGGGGAAGGGGCTTTTCCCAGGGTCCACACTGCCCCTGGGCTTCCCTTATGCCGTCAGCCCCTACTTCCACACAGGT', 'AGGCGCGGTAGGGGGACTCTCCATGGATGGGGAGGAGGCCCCAGCCCCTGAGGACGTCACCAAGTGGACCGTGGATGACGTCTGCAGCTTCGTGGGGGGCCTGTCTGGCTGTGGAGAGTACACTCGGGT', 'AGGTCTTCAGGGAGCAGGGGATCGACGGGGAGACCCTGCCACTGCTGACGGAGGAGCACCTGCTGACCAACATGGGGCTGAAGCTGGGGCCCGCCCTCAAGATCCGGGCCCAGGT', 'AGGTGGCCAGGCGCCTGGGCCGAGTTTTCTACGTGGCCAGCTTCCCCGTGGCTCTGCCACTGCAGCCACCAACCCTGCGGGCCCCGGAGCGAGAACTCGGCACAGGAGAGCAGCCCTTGTCCCCCACGACGGCCACGTCCCCCTATGGAGGGGGCCACGCCCTTGCCGGTCAAACTTCACCCAAGCAGGAGAATGGGACCTTGGCTCTACTTCCAGGGGCCCCCGACCCTTCCCAGCCTCTGTGTTG']
